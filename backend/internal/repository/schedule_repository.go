@@ -28,6 +28,29 @@ func (r ScheduleRepository) ByHash(ctx context.Context, lotID, hash, algorithm s
 	err := r.DB.WithContext(ctx).Where("timber_lot_id = ? AND input_hash = ? AND algorithm_version = ?", lotID, hash, algorithm).First(&item).Error
 	return item, err
 }
+
+// LatestFrozenBaseline returns the most recently frozen plan for a lot, if one
+// exists, so a live plan can show its completion-time and risk gap.
+func (r ScheduleRepository) LatestFrozenBaseline(ctx context.Context, lotID string) (model.DryingSchedule, error) {
+	var item model.DryingSchedule
+	err := r.DB.WithContext(ctx).
+		Where("timber_lot_id = ? AND frozen_at IS NOT NULL", lotID).
+		Order("frozen_at desc").First(&item).Error
+	return item, err
+}
+
+// LatestFrozenBaselines returns the most recently frozen plan keyed by lot ID.
+func (r ScheduleRepository) LatestFrozenBaselines(ctx context.Context) (map[string]model.DryingSchedule, error) {
+	var frozen []model.DryingSchedule
+	if err := r.DB.WithContext(ctx).Where("frozen_at IS NOT NULL").Order("frozen_at asc").Find(&frozen).Error; err != nil {
+		return nil, err
+	}
+	baselines := map[string]model.DryingSchedule{}
+	for _, item := range frozen {
+		baselines[item.TimberLotID] = item
+	}
+	return baselines, nil
+}
 func (r ScheduleRepository) ByIdempotencyKey(ctx context.Context, key string) (model.DryingSchedule, error) {
 	var item model.DryingSchedule
 	err := r.DB.WithContext(ctx).Where("idempotency_key = ?", key).First(&item).Error

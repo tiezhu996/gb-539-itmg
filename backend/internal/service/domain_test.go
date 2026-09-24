@@ -178,3 +178,64 @@ func TestScheduleFreezeAndHistoricalComparison(t *testing.T) {
 		t.Fatalf("cross-lot comparison error = %v", err)
 	}
 }
+
+func TestAdaptivePlanPersistenceAndFrozenDelta(t *testing.T) {
+	ctx, _, lot, lots, readings, schedules := testServices(t)
+	transitioned, err := lots.Transition(ctx, lot.ID, constants.LotConditioning, "engineer", "adaptive-1", lot.Version)
+	if err != nil {
+		t.Fatal(err)
+	}
+	lot = &transitioned
+	firstTime := time.Now().UTC().Add(-50 * time.Minute).Format(time.RFC3339)
+	firstInput := dto.ReadingImport{TimberLotID: lot.ID, Readings: []dto.ReadingInput{{SamplePosition: "core", MeasuredAt: firstTime, MoisturePct: 46, DryBulbC: 50, WetBulbC: 44}, {SamplePosition: "surface", MeasuredAt: firstTime, MoisturePct: 44, DryBulbC: 50, WetBulbC: 44}}}
+	if _, err = readings.Import(ctx, firstInput, "analyst", "adaptive-2"); err != nil {
+		t.Fatal(err)
+	}
+	baseline, err := schedules.Calculate(ctx, dto.ScheduleCalculate{TimberLotID: lot.ID}, "engineer", "adaptive-3")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if baseline.CheckpointsJSON == "" || baseline.PlanMode == "" {
+		t.Fatalf("adaptive plan must persist checkpoints and mode: %+v", baseline)
+	}
+	baseline, err = schedules.Review(ctx, baseline.ID, constants.ScheduleAccepted, "approved", "reviewer", "adaptive-4", baseline.Version)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err = schedules.Freeze(ctx, baseline.ID, "reviewer", "adaptive-5", baseline.Version); err != nil {
+		t.Fatal(err)
+	}
+	secondTime := time.Now().UTC().Add(-time.Minute).Format(time.RFC3339)
+	secondInput := dto.ReadingImport{TimberLotID: lot.ID, Readings: []dto.ReadingInput{{SamplePosition: "core", MeasuredAt: secondTime, MoisturePct: 30, DryBulbC: 51, WetBulbC: 43}, {SamplePosition: "surface", MeasuredAt: secondTime, MoisturePct: 28, DryBulbC: 51, WetBulbC: 43}}}
+	if _, err = readings.Import(ctx, secondInput, "analyst", "adaptive-6"); err != nil {
+		t.Fatal(err)
+	}
+	current, err := schedules.Calculate(ctx, dto.ScheduleCalculate{TimberLotID: lot.ID}, "engineer", "adaptive-7")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if current.FrozenComparison == nil {
+		t.Fatal("new plan must be returned with a comparison against the frozen plan")
+	}
+	if current.FrozenComparison.BaselineScheduleID != baseline.ID {
+		t.Fatalf("frozen baseline id = %q, want %q", current.FrozenComparison.BaselineScheduleID, baseline.ID)
+	}
+	if current.FrozenComparison.BaselineRisk != baseline.DefectRiskScore || current.FrozenComparison.Risk != current.DefectRiskScore {
+		t.Fatalf("risk delta inputs do not match stored plans: %+v", current.FrozenComparison)
+	}
+	if got := current.FrozenComparison.RiskDelta; got != current.DefectRiskScore-baseline.DefectRiskScore {
+		t.Fatalf("risk delta = %v, want %v", got, current.DefectRiskScore-baseline.DefectRiskScore)
+	}
+	fetched, err := schedules.Get(ctx, current.ID)
+	if err != nil || fetched.FrozenComparison == nil || fetched.FrozenComparison.BaselineScheduleID != baseline.ID {
+		t.Fatalf("Get must carry the frozen comparison: %+v %v", fetched.FrozenComparison, err)
+	}
+	frozenFetched, err := schedules.Get(ctx, baseline.ID)
+	if err != nil || frozenFetched.FrozenComparison != nil {
+		t.Fatalf("frozen plan must not compare to itself: %+v %v", frozenFetched.FrozenComparison, err)
+	}
+	again, err := schedules.Calculate(ctx, dto.ScheduleCalculate{TimberLotID: lot.ID}, "engineer", "adaptive-8")
+	if err != nil || again.ID != current.ID {
+		t.Fatalf("identical input must reuse the same plan: %+v %v", again, err)
+	}
+}

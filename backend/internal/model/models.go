@@ -58,30 +58,33 @@ type MoistureReading struct {
 }
 
 type DryingSchedule struct {
-	ID                     string     `gorm:"primaryKey" json:"id"`
-	TimberLotID            string     `gorm:"index;not null;uniqueIndex:idx_schedule_input" json:"timber_lot_id"`
-	KilnSnapshot           string     `json:"kiln_snapshot"`
-	AlgorithmVersion       string     `gorm:"uniqueIndex:idx_schedule_input" json:"algorithm_version"`
-	InputHash              string     `gorm:"uniqueIndex:idx_schedule_input" json:"input_hash"`
-	IdempotencyKey         string     `gorm:"index" json:"idempotency_key"`
-	RuleSetVersion         string     `json:"rule_set_version"`
-	StagesJSON             string     `json:"stages_json"`
-	RecommendedChangesJSON string     `json:"recommended_changes_json"`
-	RuleEvidenceJSON       string     `json:"rule_evidence_json"`
-	PredictedFinishAt      *time.Time `json:"predicted_finish_at"`
-	DefectRiskScore        float64    `json:"defect_risk_score"`
-	ScheduleState          string     `json:"schedule_state"`
-	Explanation            string     `json:"explanation"`
-	FailureReason          string     `json:"failure_reason"`
-	FrozenAt               *time.Time `json:"frozen_at"`
-	FrozenBy               string     `json:"frozen_by"`
-	FrozenSnapshot         string     `json:"frozen_snapshot"`
-	BaselineScheduleID     string     `gorm:"index" json:"baseline_schedule_id"`
-	ComparisonJSON         string     `json:"comparison_json"`
-	CalculatedAt           time.Time  `json:"calculated_at"`
-	CreatedBy              string     `json:"created_by"`
-	ReviewedBy             string     `json:"reviewed_by"`
-	Version                int        `json:"version"`
+	ID                     string                `gorm:"primaryKey" json:"id"`
+	TimberLotID            string                `gorm:"index;not null;uniqueIndex:idx_schedule_input" json:"timber_lot_id"`
+	KilnSnapshot           string                `json:"kiln_snapshot"`
+	AlgorithmVersion       string                `gorm:"uniqueIndex:idx_schedule_input" json:"algorithm_version"`
+	InputHash              string                `gorm:"uniqueIndex:idx_schedule_input" json:"input_hash"`
+	IdempotencyKey         string                `gorm:"index" json:"idempotency_key"`
+	RuleSetVersion         string                `json:"rule_set_version"`
+	StagesJSON             string                `json:"stages_json"`
+	RecommendedChangesJSON string                `json:"recommended_changes_json"`
+	RuleEvidenceJSON       string                `json:"rule_evidence_json"`
+	CheckpointsJSON        string                `json:"checkpoints_json"`
+	PlanMode               string                `json:"plan_mode"`
+	PredictedFinishAt      *time.Time            `json:"predicted_finish_at"`
+	DefectRiskScore        float64               `json:"defect_risk_score"`
+	ScheduleState          string                `json:"schedule_state"`
+	Explanation            string                `json:"explanation"`
+	FailureReason          string                `json:"failure_reason"`
+	FrozenAt               *time.Time            `json:"frozen_at"`
+	FrozenBy               string                `json:"frozen_by"`
+	FrozenSnapshot         string                `json:"frozen_snapshot"`
+	BaselineScheduleID     string                `gorm:"index" json:"baseline_schedule_id"`
+	ComparisonJSON         string                `json:"comparison_json"`
+	FrozenComparison       *FrozenPlanComparison `gorm:"-" json:"frozen_comparison,omitempty"`
+	CalculatedAt           time.Time             `json:"calculated_at"`
+	CreatedBy              string                `json:"created_by"`
+	ReviewedBy             string                `json:"reviewed_by"`
+	Version                int                   `json:"version"`
 }
 
 type User struct {
@@ -91,6 +94,19 @@ type User struct {
 	PasswordHash string    `json:"-"`
 	Role         string    `json:"role"`
 	CreatedAt    time.Time `json:"created_at"`
+}
+
+// FrozenPlanComparison compares a live plan against the most recently frozen
+// plan for the same lot. It is assembled on read and never persisted.
+type FrozenPlanComparison struct {
+	BaselineScheduleID string     `json:"baseline_schedule_id"`
+	FrozenAt           *time.Time `json:"frozen_at"`
+	PredictedFinishAt  *time.Time `json:"predicted_finish_at"`
+	BaselineFinishAt   *time.Time `json:"baseline_finish_at"`
+	FinishDeltaHours   float64    `json:"finish_delta_hours"`
+	Risk               float64    `json:"risk"`
+	BaselineRisk       float64    `json:"baseline_risk"`
+	RiskDelta          float64    `json:"risk_delta"`
 }
 
 type AuditEvent struct {

@@ -42,6 +42,7 @@ type Result struct {
 	Stages      []StageMetric  `json:"stages"`
 	Suggestions []Suggestion   `json:"suggestions"`
 	Evidence    []RuleEvidence `json:"evidence"`
+	Plan        AdaptivePlan   `json:"plan"`
 	Risk        float64        `json:"risk"`
 	Explanation string         `json:"explanation"`
 	FinishAt    time.Time      `json:"finish_at"`
@@ -117,14 +118,25 @@ func Evaluate(lot model.TimberLot, kiln model.DryingKiln, readings []model.Moist
 	}
 	anomalies := anomalyCount(ordered, avg)
 	risk := riskScore(evidence, anomalies)
-	suggestions := constrainedSuggestions(lot, kiln, rule, currentTemperature, currentHumidity, avg, gradient, rate, evidence)
-	duration := estimateDuration(lot, avg, rate)
 	finishBase := ordered[len(ordered)-1].MeasuredAt
 	if finishBase.IsZero() {
 		finishBase = evaluatedAt.UTC()
 	}
-	explanation := fmt.Sprintf("规则集 %s 使用 %s/%0.0fmm 材料目录，在 %s 阶段核验温度、相对湿度、含水率梯度与干燥速率。采样覆盖 %d 个事件、%.0f%% 成对中心/表层读数，最长间隔 %.1f 小时。%s。建议仅是离线工艺建议，设备联锁和人工复核仍为最终边界。", rule.Version, profile.ID, lot.ThicknessMM, stage, coverage.EventCount, coverage.PairCompleteness*100, coverage.LargestGapHours, profile.Notes)
-	return Result{Stages: []StageMetric{{Stage: stage, AverageMoisture: round(avg, 1), Gradient: round(gradient, 1), DryingRate: round(rate, 3), Anomalies: anomalies}}, Suggestions: suggestions, Evidence: evidence, Risk: risk, Explanation: explanation, FinishAt: finishBase.Add(duration)}, nil
+	plan := buildAdaptivePlan(lot, kiln, ordered, rule, profile, stage, currentTemperature, currentHumidity, avg, evidence, finishBase, coverage)
+	suggestions := constrainedSuggestions(lot, kiln, rule, currentTemperature, currentHumidity, avg, gradient, rate, evidence)
+	if plan.Mode == PlanModeEqualizingRetest {
+		suggestions = []Suggestion{{Parameter: "工艺处置", Rule: "存在未通过的安全规则；先安排均衡复测，复测合格前不提供升温或降湿建议。", Evidence: evidence}}
+	}
+	duration := estimateDuration(lot, avg, rate)
+	explanation := fmt.Sprintf("规则集 %s 使用 %s/%0.0fmm 材料目录，在 %s 阶段核验温度、相对湿度、含水率梯度与干燥速率。采样覆盖 %d 个事件、%.0f%% 成对中心/表层读数，最长间隔 %.1f 小时。%s。自适应排程为 %s 模式，按 %s 阶段与最近两次成对读数安排 3 个检查点。建议仅是离线工艺建议，设备联锁和人工复核仍为最终边界。", rule.Version, profile.ID, lot.ThicknessMM, stage, coverage.EventCount, coverage.PairCompleteness*100, coverage.LargestGapHours, profile.Notes, planModeName(plan.Mode), stage)
+	return Result{Stages: []StageMetric{{Stage: stage, AverageMoisture: round(avg, 1), Gradient: round(gradient, 1), DryingRate: round(rate, 3), Anomalies: anomalies}}, Suggestions: suggestions, Evidence: evidence, Plan: plan, Risk: risk, Explanation: explanation, FinishAt: finishBase.Add(duration)}, nil
+}
+
+func planModeName(mode string) string {
+	if mode == PlanModeEqualizingRetest {
+		return "均衡复测"
+	}
+	return "自适应推进"
 }
 
 func AnalyzeCoverage(readings []model.MoistureReading) SeriesCoverage {

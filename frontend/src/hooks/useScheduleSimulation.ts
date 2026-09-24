@@ -1,1 +1,1 @@
-import {scheduleApi} from '../api/schedules'; export function useScheduleSimulation(){return {calculate:(lotId:string)=>scheduleApi.calculate(lotId)}}
+import {scheduleApi} from '../api/schedules'; export function useScheduleSimulation(){return {calculate:(lotId:string)=>scheduleApi.calculate(lotId),get:(id:string)=>scheduleApi.get(id)}}

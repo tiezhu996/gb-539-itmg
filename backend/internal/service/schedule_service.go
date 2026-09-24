@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"math"
 	"sort"
 	"time"
 
@@ -17,7 +18,7 @@ import (
 	"timber-kiln-drying-optimizer/backend/internal/util"
 )
 
-const AlgorithmVersion = "curve-v2.0"
+const AlgorithmVersion = "curve-v2.1"
 
 type ScheduleService struct {
 	Repo     repository.ScheduleRepository
@@ -28,14 +29,64 @@ type ScheduleService struct {
 }
 
 func (s ScheduleService) List(ctx context.Context) ([]model.DryingSchedule, error) {
-	return s.Repo.List(ctx)
+	items, err := s.Repo.List(ctx)
+	if err != nil {
+		return items, err
+	}
+	baselines, err := s.Repo.LatestFrozenBaselines(ctx)
+	if err != nil {
+		return items, err
+	}
+	for index := range items {
+		attachBaseline(&items[index], baselines[items[index].TimberLotID])
+	}
+	return items, nil
 }
 func (s ScheduleService) Get(ctx context.Context, id string) (model.DryingSchedule, error) {
 	item, err := s.Repo.Get(ctx, id)
 	if errors.Is(err, gorm.ErrRecordNotFound) {
 		return item, ErrNotFound
 	}
-	return item, err
+	if err != nil {
+		return item, err
+	}
+	s.attachFrozenComparison(ctx, &item)
+	return item, nil
+}
+
+// attachFrozenComparison fills the read-only delta against the most recent
+// frozen plan of the same lot. It never fails a request or writes state.
+func (s ScheduleService) attachFrozenComparison(ctx context.Context, item *model.DryingSchedule) {
+	if item.FrozenAt != nil {
+		return
+	}
+	baseline, err := s.Repo.LatestFrozenBaseline(ctx, item.TimberLotID)
+	if err != nil {
+		return
+	}
+	attachBaseline(item, baseline)
+}
+
+func attachBaseline(item *model.DryingSchedule, baseline model.DryingSchedule) {
+	if item.FrozenAt != nil || baseline.ID == "" || baseline.ID == item.ID {
+		return
+	}
+	item.FrozenComparison = &model.FrozenPlanComparison{
+		BaselineScheduleID: baseline.ID,
+		FrozenAt:           baseline.FrozenAt,
+		PredictedFinishAt:  item.PredictedFinishAt,
+		BaselineFinishAt:   baseline.PredictedFinishAt,
+		Risk:               item.DefectRiskScore,
+		BaselineRisk:       baseline.DefectRiskScore,
+		RiskDelta:          roundOne(item.DefectRiskScore - baseline.DefectRiskScore),
+	}
+	if item.PredictedFinishAt != nil && baseline.PredictedFinishAt != nil {
+		item.FrozenComparison.FinishDeltaHours = roundOne(item.PredictedFinishAt.Sub(*baseline.PredictedFinishAt).Hours())
+	}
+}
+
+func roundOne(value float64) float64 {
+	return math.Round(value*10) / 10
 }
 
 // Calculate creates an immutable calculation record. The initial calculating
@@ -63,10 +114,12 @@ func (s ScheduleService) Calculate(ctx context.Context, input dto.ScheduleCalcul
 			if existing.InputHash != inputHash {
 				return existing, fmt.Errorf("idempotency key was used for a different input: %w", ErrConflict)
 			}
+			s.attachFrozenComparison(ctx, &existing)
 			return existing, nil
 		}
 	}
 	if existing, findErr := s.Repo.ByHash(ctx, lot.ID, inputHash, AlgorithmVersion); findErr == nil {
+		s.attachFrozenComparison(ctx, &existing)
 		return existing, nil
 	}
 
@@ -106,7 +159,11 @@ func (s ScheduleService) Calculate(ctx context.Context, input dto.ScheduleCalcul
 	if marshalErr != nil {
 		return item, marshalErr
 	}
-	updates := map[string]any{"stages_json": string(stages), "recommended_changes_json": string(suggestions), "rule_evidence_json": string(evidence), "predicted_finish_at": result.FinishAt, "defect_risk_score": result.Risk, "explanation": result.Explanation}
+	checkpoints, marshalErr := json.Marshal(result.Plan.Checkpoints)
+	if marshalErr != nil {
+		return item, marshalErr
+	}
+	updates := map[string]any{"stages_json": string(stages), "recommended_changes_json": string(suggestions), "rule_evidence_json": string(evidence), "checkpoints_json": string(checkpoints), "plan_mode": result.Plan.Mode, "predicted_finish_at": result.FinishAt, "defect_risk_score": result.Risk, "explanation": result.Explanation}
 	updated, err := s.Repo.Transition(ctx, item.ID, constants.ScheduleCalculating, constants.ScheduleProposed, item.Version, updates)
 	if err != nil {
 		return item, err
@@ -116,8 +173,10 @@ func (s ScheduleService) Calculate(ctx context.Context, input dto.ScheduleCalcul
 	}
 	item.ScheduleState, item.Version = constants.ScheduleProposed, item.Version+1
 	item.StagesJSON, item.RecommendedChangesJSON, item.RuleEvidenceJSON = string(stages), string(suggestions), string(evidence)
+	item.CheckpointsJSON, item.PlanMode = string(checkpoints), result.Plan.Mode
 	item.PredictedFinishAt, item.DefectRiskScore, item.Explanation = &result.FinishAt, result.Risk, result.Explanation
 	_ = s.Audit.Record(ctx, requestID, "schedule", item.ID, "calculated", actor, nil, item)
+	s.attachFrozenComparison(ctx, &item)
 	return item, nil
 }
 
@@ -212,8 +271,10 @@ func (s ScheduleService) Freeze(ctx context.Context, id, actor, requestID string
 		Stages         string
 		Evidence       string
 		Changes        string
+		Checkpoints    string
+		PlanMode       string
 		FinishAt       *time.Time
-	}{item.RuleSetVersion, item.AlgorithmVersion, item.KilnSnapshot, item.StagesJSON, item.RuleEvidenceJSON, item.RecommendedChangesJSON, item.PredictedFinishAt}
+	}{item.RuleSetVersion, item.AlgorithmVersion, item.KilnSnapshot, item.StagesJSON, item.RuleEvidenceJSON, item.RecommendedChangesJSON, item.CheckpointsJSON, item.PlanMode, item.PredictedFinishAt}
 	now := time.Now().UTC()
 	frozen, err := s.Repo.Freeze(ctx, item.ID, item.Version, actor, now, util.JSON(snapshot))
 	if err != nil {
