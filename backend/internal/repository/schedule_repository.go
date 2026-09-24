@@ -15,6 +15,20 @@ func (r ScheduleRepository) List(ctx context.Context) ([]model.DryingSchedule, e
 	err := r.DB.WithContext(ctx).Order("calculated_at desc").Find(&items).Error
 	return items, err
 }
+
+// FrozenForLots returns the most recently frozen accepted schedule per lot,
+// used to show every newer plan's completion-time and risk difference.
+func (r ScheduleRepository) FrozenForLots(ctx context.Context, lotIDs []string) ([]model.DryingSchedule, error) {
+	items := []model.DryingSchedule{}
+	if len(lotIDs) == 0 {
+		return items, nil
+	}
+	err := r.DB.WithContext(ctx).
+		Where("timber_lot_id IN ? AND frozen_at IS NOT NULL", lotIDs).
+		Order("frozen_at desc").
+		Find(&items).Error
+	return items, err
+}
 func (r ScheduleRepository) Get(ctx context.Context, id string) (model.DryingSchedule, error) {
 	var item model.DryingSchedule
 	err := r.DB.WithContext(ctx).First(&item, "id = ?", id).Error

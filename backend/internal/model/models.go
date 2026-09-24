@@ -68,6 +68,7 @@ type DryingSchedule struct {
 	StagesJSON             string     `json:"stages_json"`
 	RecommendedChangesJSON string     `json:"recommended_changes_json"`
 	RuleEvidenceJSON       string     `json:"rule_evidence_json"`
+	AdaptivePlanJSON       string     `json:"adaptive_plan_json"`
 	PredictedFinishAt      *time.Time `json:"predicted_finish_at"`
 	DefectRiskScore        float64    `json:"defect_risk_score"`
 	ScheduleState          string     `json:"schedule_state"`
@@ -82,6 +83,21 @@ type DryingSchedule struct {
 	CreatedBy              string     `json:"created_by"`
 	ReviewedBy             string     `json:"reviewed_by"`
 	Version                int        `json:"version"`
+	// FrozenBaselineView is populated by the service when a newer plan shares a
+	// lot with a frozen baseline; it is never persisted on the schedule row.
+	FrozenBaselineView *FrozenBaselineView `gorm:"-" json:"frozen_baseline_view,omitempty"`
+}
+
+// FrozenBaselineView compares a plan against the frozen plan of the same lot:
+// the two predicted completion times and the defect-risk difference.
+type FrozenBaselineView struct {
+	BaselineScheduleID string     `json:"baseline_schedule_id"`
+	BaselineFinishAt   *time.Time `json:"baseline_finish_at"`
+	CurrentFinishAt    *time.Time `json:"current_finish_at"`
+	FinishDeltaHours   float64    `json:"finish_delta_hours"`
+	BaselineRisk       float64    `json:"baseline_risk_score"`
+	CurrentRisk        float64    `json:"current_risk_score"`
+	RiskDelta          float64    `json:"risk_delta"`
 }
 
 type User struct {

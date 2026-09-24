@@ -178,3 +178,74 @@ func TestScheduleFreezeAndHistoricalComparison(t *testing.T) {
 		t.Fatalf("cross-lot comparison error = %v", err)
 	}
 }
+
+func TestAdaptivePlanPersistsAndFrozenBaselineViewReportsFinishAndRiskDeltas(t *testing.T) {
+	ctx, _, lot, lots, readings, schedules := testServices(t)
+	transitioned, err := lots.Transition(ctx, lot.ID, constants.LotConditioning, "engineer", "adaptive-1", lot.Version)
+	if err != nil {
+		t.Fatal(err)
+	}
+	lot = &transitioned
+	firstTime := time.Now().UTC().Add(-50 * time.Minute).Format(time.RFC3339)
+	firstInput := dto.ReadingImport{TimberLotID: lot.ID, Readings: []dto.ReadingInput{{SamplePosition: "core", MeasuredAt: firstTime, MoisturePct: 46, DryBulbC: 50, WetBulbC: 44}, {SamplePosition: "surface", MeasuredAt: firstTime, MoisturePct: 44, DryBulbC: 50, WetBulbC: 44}}}
+	if _, err = readings.Import(ctx, firstInput, "analyst", "adaptive-2"); err != nil {
+		t.Fatal(err)
+	}
+	baseline, err := schedules.Calculate(ctx, dto.ScheduleCalculate{TimberLotID: lot.ID}, "engineer", "adaptive-3")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if baseline.AlgorithmVersion != AlgorithmVersion || baseline.AdaptivePlanJSON == "" {
+		t.Fatalf("adaptive plan not persisted: %+v", baseline)
+	}
+	// Same inputs reuse the original plan instead of creating a new version.
+	reused, err := schedules.Calculate(ctx, dto.ScheduleCalculate{TimberLotID: lot.ID}, "engineer", "adaptive-4")
+	if err != nil || reused.ID != baseline.ID {
+		t.Fatalf("same-input reuse = %+v, %v", reused, err)
+	}
+	baseline, err = schedules.Review(ctx, baseline.ID, constants.ScheduleAccepted, "approved", "reviewer", "adaptive-5", baseline.Version)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err = schedules.Freeze(ctx, baseline.ID, "reviewer", "adaptive-6", baseline.Version); err != nil {
+		t.Fatal(err)
+	}
+	secondTime := time.Now().UTC().Add(-time.Minute).Format(time.RFC3339)
+	secondInput := dto.ReadingImport{TimberLotID: lot.ID, Readings: []dto.ReadingInput{{SamplePosition: "core", MeasuredAt: secondTime, MoisturePct: 30, DryBulbC: 51, WetBulbC: 43}, {SamplePosition: "surface", MeasuredAt: secondTime, MoisturePct: 28, DryBulbC: 51, WetBulbC: 43}}}
+	if _, err = readings.Import(ctx, secondInput, "analyst", "adaptive-7"); err != nil {
+		t.Fatal(err)
+	}
+	current, err := schedules.Calculate(ctx, dto.ScheduleCalculate{TimberLotID: lot.ID}, "engineer", "adaptive-8")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if current.ID == baseline.ID || current.FrozenBaselineView == nil {
+		t.Fatalf("new plan missing frozen baseline view: %+v", current)
+	}
+	view := current.FrozenBaselineView
+	if view.BaselineScheduleID != baseline.ID || view.BaselineFinishAt == nil || view.CurrentFinishAt == nil {
+		t.Fatalf("baseline view = %+v", view)
+	}
+	if view.CurrentRisk != current.DefectRiskScore || view.BaselineRisk != baseline.DefectRiskScore {
+		t.Fatalf("risk view = %+v", view)
+	}
+	listed, err := schedules.List(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	views := 0
+	for _, item := range listed {
+		if item.ID == current.ID {
+			if item.FrozenBaselineView == nil || item.FrozenBaselineView.BaselineScheduleID != baseline.ID {
+				t.Fatalf("list did not attach baseline view: %+v", item.FrozenBaselineView)
+			}
+			views++
+		}
+		if item.FrozenAt != nil && item.FrozenBaselineView != nil {
+			t.Fatalf("frozen plan must not compare to itself: %+v", item)
+		}
+	}
+	if views != 1 {
+		t.Fatalf("expected one current-plan view, got %d", views)
+	}
+}

@@ -18,7 +18,7 @@ docker compose up -d --build
 - `/kilns`：窑炉档案、安全边界和编辑操作。
 - `/lots`：登记木材工艺批次，按 `queued -> conditioning -> drying -> equalizing -> completed` 迁移，任意运行阶段可中止。
 - `/readings`：导入含水率和干湿球读数，展示平均含水率曲线。
-- `/schedules`：按树种、厚度、读数和窑炉快照计算建议，展示风险、规则证据和人工审核。
+- `/schedules`：按树种、厚度、读数和窑炉快照计算建议，展示未来 24 小时三个自适应检查点（目标干球温度、相对湿度、预计含水率、复查时间，超 8 小时间隔提醒补测）、规则未通过时的均衡复测、风险、规则证据、与所冻结计划的完成时间/风险差以及人工审核。
 - `/audit`：按 request ID、实体和操作者查看前后快照。
 
 共享组件为 `MoistureStageBadge`、`DryingCurveChart`、`RuleEvidenceDrawer`；曲线计算交互封装在 `useScheduleSimulation`。四个实体在数据库、Go model/dto/repository/service/handler/router 与 Angular type/api/store/page 中均保持独立文件。
@@ -40,7 +40,7 @@ database/init.sql        PostgreSQL 初始化
 
 ## 安全与算法边界
 
-JWT + RBAC 角色为 `admin`、`kiln_engineer`、`quality_analyst`、`reviewer`、`auditor`。计划创建者不能接受自己的建议；写操作记录 request ID、操作者和前后快照；无效读数返回 422、非法状态/版本返回 409、越权返回 403。算法版本为 `curve-v2.0`，同一输入哈希幂等复用，建议永远限制在窑炉边界内。阶段枚举 `green | fiber_saturation | bound_water | target` 位于 `backend/internal/constants` 与 `frontend/src/types/enums`；批次状态枚举位于同处，README 与各 model、dto、algorithm、service、store、组件和页面共享。
+JWT + RBAC 角色为 `admin`、`kiln_engineer`、`quality_analyst`、`reviewer`、`auditor`。计划创建者不能接受自己的建议；写操作记录 request ID、操作者和前后快照；无效读数返回 422、非法状态/版本返回 409、越权返回 403。算法版本为 `curve-v2.1`，同一输入哈希幂等复用，建议永远限制在窑炉边界内。每次仿真同时生成自适应排程：按当前阶段和最近两次中心/表层成对读数确定复查节奏，安排未来 24 小时三个检查点（目标干球温度、相对湿度、预计含水率、复查时间），检查点间隔超过 8 小时时提醒在间隔中点补测；温度上限取材料规则与窑炉边界的更小值、相对湿度下限取更大值，梯度和干燥速率受材料规则约束；任一规则当前未通过时只排均衡复测，检查点不得升温或降湿。非冻结计划自动附带与同批次所冻结计划的完成时间差和风险差。阶段枚举 `green | fiber_saturation | bound_water | target` 位于 `backend/internal/constants` 与 `frontend/src/types/enums`；批次状态枚举位于同处，README 与各 model、dto、algorithm、service、store、组件和页面共享。
 
 ## 环境、端口与本地开发
 

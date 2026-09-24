@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"math"
 	"sort"
 	"time"
 
@@ -17,7 +18,7 @@ import (
 	"timber-kiln-drying-optimizer/backend/internal/util"
 )
 
-const AlgorithmVersion = "curve-v2.0"
+const AlgorithmVersion = "curve-v2.1"
 
 type ScheduleService struct {
 	Repo     repository.ScheduleRepository
@@ -28,14 +29,86 @@ type ScheduleService struct {
 }
 
 func (s ScheduleService) List(ctx context.Context) ([]model.DryingSchedule, error) {
-	return s.Repo.List(ctx)
+	items, err := s.Repo.List(ctx)
+	if err != nil {
+		return items, err
+	}
+	if err = s.attachFrozenBaselineViews(ctx, items); err != nil {
+		return items, err
+	}
+	return items, nil
 }
 func (s ScheduleService) Get(ctx context.Context, id string) (model.DryingSchedule, error) {
 	item, err := s.Repo.Get(ctx, id)
 	if errors.Is(err, gorm.ErrRecordNotFound) {
 		return item, ErrNotFound
 	}
-	return item, err
+	if err != nil {
+		return item, err
+	}
+	item.FrozenBaselineView = s.frozenBaselineView(ctx, item)
+	return item, nil
+}
+
+// attachFrozenBaselineViews adds the completion-time and risk comparison with
+// the frozen plan of the same lot in a single lookup. Frozen plans are their
+// own canonical baseline and get no view; every other row compares to the most
+// recently frozen plan of its lot.
+func (s ScheduleService) attachFrozenBaselineViews(ctx context.Context, items []model.DryingSchedule) error {
+	lotIDs := []string{}
+	seen := map[string]bool{}
+	for _, item := range items {
+		if item.FrozenAt != nil || seen[item.TimberLotID] {
+			continue
+		}
+		seen[item.TimberLotID] = true
+		lotIDs = append(lotIDs, item.TimberLotID)
+	}
+	frozen, err := s.Repo.FrozenForLots(ctx, lotIDs)
+	if err != nil {
+		return err
+	}
+	baselines := map[string]model.DryingSchedule{}
+	for _, item := range frozen {
+		if _, exists := baselines[item.TimberLotID]; !exists {
+			baselines[item.TimberLotID] = item
+		}
+	}
+	for index := range items {
+		if items[index].FrozenAt != nil {
+			continue
+		}
+		if baseline, ok := baselines[items[index].TimberLotID]; ok {
+			items[index].FrozenBaselineView = frozenBaselineView(items[index], baseline)
+		}
+	}
+	return nil
+}
+
+func (s ScheduleService) frozenBaselineView(ctx context.Context, item model.DryingSchedule) *model.FrozenBaselineView {
+	if item.FrozenAt != nil {
+		return nil
+	}
+	frozen, err := s.Repo.FrozenForLots(ctx, []string{item.TimberLotID})
+	if err != nil || len(frozen) == 0 {
+		return nil
+	}
+	return frozenBaselineView(item, frozen[0])
+}
+
+func frozenBaselineView(item, baseline model.DryingSchedule) *model.FrozenBaselineView {
+	if baseline.FrozenAt == nil || item.ID == baseline.ID {
+		return nil
+	}
+	view := &model.FrozenBaselineView{BaselineScheduleID: baseline.ID, BaselineFinishAt: baseline.PredictedFinishAt, CurrentFinishAt: item.PredictedFinishAt, BaselineRisk: baseline.DefectRiskScore, CurrentRisk: item.DefectRiskScore, RiskDelta: roundDelta(item.DefectRiskScore - baseline.DefectRiskScore)}
+	if item.PredictedFinishAt != nil && baseline.PredictedFinishAt != nil {
+		view.FinishDeltaHours = roundDelta(item.PredictedFinishAt.Sub(*baseline.PredictedFinishAt).Hours())
+	}
+	return view
+}
+
+func roundDelta(value float64) float64 {
+	return math.Round(value*10) / 10
 }
 
 // Calculate creates an immutable calculation record. The initial calculating
@@ -106,7 +179,11 @@ func (s ScheduleService) Calculate(ctx context.Context, input dto.ScheduleCalcul
 	if marshalErr != nil {
 		return item, marshalErr
 	}
-	updates := map[string]any{"stages_json": string(stages), "recommended_changes_json": string(suggestions), "rule_evidence_json": string(evidence), "predicted_finish_at": result.FinishAt, "defect_risk_score": result.Risk, "explanation": result.Explanation}
+	plan, marshalErr := json.Marshal(result.AdaptivePlan)
+	if marshalErr != nil {
+		return item, marshalErr
+	}
+	updates := map[string]any{"stages_json": string(stages), "recommended_changes_json": string(suggestions), "rule_evidence_json": string(evidence), "adaptive_plan_json": string(plan), "predicted_finish_at": result.FinishAt, "defect_risk_score": result.Risk, "explanation": result.Explanation}
 	updated, err := s.Repo.Transition(ctx, item.ID, constants.ScheduleCalculating, constants.ScheduleProposed, item.Version, updates)
 	if err != nil {
 		return item, err
@@ -115,8 +192,9 @@ func (s ScheduleService) Calculate(ctx context.Context, input dto.ScheduleCalcul
 		return item, ErrConflict
 	}
 	item.ScheduleState, item.Version = constants.ScheduleProposed, item.Version+1
-	item.StagesJSON, item.RecommendedChangesJSON, item.RuleEvidenceJSON = string(stages), string(suggestions), string(evidence)
+	item.StagesJSON, item.RecommendedChangesJSON, item.RuleEvidenceJSON, item.AdaptivePlanJSON = string(stages), string(suggestions), string(evidence), string(plan)
 	item.PredictedFinishAt, item.DefectRiskScore, item.Explanation = &result.FinishAt, result.Risk, result.Explanation
+	item.FrozenBaselineView = s.frozenBaselineView(ctx, item)
 	_ = s.Audit.Record(ctx, requestID, "schedule", item.ID, "calculated", actor, nil, item)
 	return item, nil
 }
@@ -149,6 +227,7 @@ func (s ScheduleService) Review(ctx context.Context, id, decision, note, actor, 
 		return item, ErrConflict
 	}
 	item.ScheduleState, item.ReviewedBy, item.Explanation, item.Version = next, actor, explanation, item.Version+1
+	item.FrozenBaselineView = s.frozenBaselineView(ctx, item)
 	_ = s.Audit.Record(ctx, requestID, "schedule", id, "reviewed", actor, before, item)
 	return item, nil
 }
@@ -212,8 +291,9 @@ func (s ScheduleService) Freeze(ctx context.Context, id, actor, requestID string
 		Stages         string
 		Evidence       string
 		Changes        string
+		AdaptivePlan   string
 		FinishAt       *time.Time
-	}{item.RuleSetVersion, item.AlgorithmVersion, item.KilnSnapshot, item.StagesJSON, item.RuleEvidenceJSON, item.RecommendedChangesJSON, item.PredictedFinishAt}
+	}{item.RuleSetVersion, item.AlgorithmVersion, item.KilnSnapshot, item.StagesJSON, item.RuleEvidenceJSON, item.RecommendedChangesJSON, item.AdaptivePlanJSON, item.PredictedFinishAt}
 	now := time.Now().UTC()
 	frozen, err := s.Repo.Freeze(ctx, item.ID, item.Version, actor, now, util.JSON(snapshot))
 	if err != nil {

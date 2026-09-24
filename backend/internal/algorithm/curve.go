@@ -39,12 +39,13 @@ type Suggestion struct {
 }
 
 type Result struct {
-	Stages      []StageMetric  `json:"stages"`
-	Suggestions []Suggestion   `json:"suggestions"`
-	Evidence    []RuleEvidence `json:"evidence"`
-	Risk        float64        `json:"risk"`
-	Explanation string         `json:"explanation"`
-	FinishAt    time.Time      `json:"finish_at"`
+	Stages       []StageMetric  `json:"stages"`
+	Suggestions  []Suggestion   `json:"suggestions"`
+	Evidence     []RuleEvidence `json:"evidence"`
+	Risk         float64        `json:"risk"`
+	Explanation  string         `json:"explanation"`
+	FinishAt     time.Time      `json:"finish_at"`
+	AdaptivePlan *AdaptivePlan  `json:"adaptive_plan"`
 }
 
 type SeriesCoverage struct {
@@ -90,7 +91,7 @@ func Evaluate(lot model.TimberLot, kiln model.DryingKiln, readings []model.Moist
 	coverage := AnalyzeCoverage(ordered)
 	avg := averageMoisture(ordered)
 	gradient := sampleGradient(ordered)
-	rate := dryingRate(ordered)
+	rate := dryingRate(ordered, pairedEvents(ordered))
 	stage := StageFor(avg, lot.TargetMoisturePct)
 	rule, ok := RuleFor(stage)
 	if !ok {
@@ -124,7 +125,8 @@ func Evaluate(lot model.TimberLot, kiln model.DryingKiln, readings []model.Moist
 		finishBase = evaluatedAt.UTC()
 	}
 	explanation := fmt.Sprintf("规则集 %s 使用 %s/%0.0fmm 材料目录，在 %s 阶段核验温度、相对湿度、含水率梯度与干燥速率。采样覆盖 %d 个事件、%.0f%% 成对中心/表层读数，最长间隔 %.1f 小时。%s。建议仅是离线工艺建议，设备联锁和人工复核仍为最终边界。", rule.Version, profile.ID, lot.ThicknessMM, stage, coverage.EventCount, coverage.PairCompleteness*100, coverage.LargestGapHours, profile.Notes)
-	return Result{Stages: []StageMetric{{Stage: stage, AverageMoisture: round(avg, 1), Gradient: round(gradient, 1), DryingRate: round(rate, 3), Anomalies: anomalies}}, Suggestions: suggestions, Evidence: evidence, Risk: risk, Explanation: explanation, FinishAt: finishBase.Add(duration)}, nil
+	plan := BuildAdaptivePlan(lot, kiln, rule, profile, ordered, currentTemperature, currentHumidity, avg, rate, evidence, evaluatedAt)
+	return Result{Stages: []StageMetric{{Stage: stage, AverageMoisture: round(avg, 1), Gradient: round(gradient, 1), DryingRate: round(rate, 3), Anomalies: anomalies}}, Suggestions: suggestions, Evidence: evidence, Risk: risk, Explanation: explanation, FinishAt: finishBase.Add(duration), AdaptivePlan: &plan}, nil
 }
 
 func AnalyzeCoverage(readings []model.MoistureReading) SeriesCoverage {
@@ -241,7 +243,18 @@ func sampleGradient(readings []model.MoistureReading) float64 {
 	return max - min
 }
 
-func dryingRate(readings []model.MoistureReading) float64 {
+// dryingRate prefers the local rate between the two most recent core/surface
+// paired events (the same two readings that drive the adaptive schedule), so a
+// single fast measurement cannot be diluted by the full series. The local
+// span is floored at 4 hours because moisture cannot move meaningfully across
+// a few minutes of shop-floor sampling. It falls back to the full-series span
+// when fewer than two paired events exist.
+func dryingRate(readings []model.MoistureReading, pairs []pairedEvent) float64 {
+	if len(pairs) >= 2 {
+		start, end := pairs[len(pairs)-2], pairs[len(pairs)-1]
+		hours := math.Max(4, end.at.Sub(start.at).Hours())
+		return math.Max(0, start.moisture-end.moisture) / hours
+	}
 	if len(readings) < 2 {
 		return 0
 	}
